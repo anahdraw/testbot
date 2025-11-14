@@ -1,204 +1,222 @@
-import streamlit as st
-import chromadb
-from chromadb.utils import embedding_functions
-from sentence_transformers import SentenceTransformer
 import os
+import io
+import uuid
+import time
+import streamlit as st
 
-st.set_page_config(layout="wide")
-st.title("ChromaDB Local to TryChroma (Cloud) Uploader")
-st.markdown("---")
-
-# --- Sidebar Configuration ---
-st.sidebar.header("TryChroma Cloud Settings")
-trychroma_api_key = st.sidebar.text_input(
-    "TryChroma API Key/Token", 
-    type="password", 
-    help="Dapatkan dari dashboard TryChroma Anda."
-)
-trychroma_client_url = st.sidebar.text_input(
-    "TryChroma Client URL",
-    value="https://api.trychroma.com", # Default URL, sesuaikan jika berbeda
-    help="URL endpoint ChromaDB Cloud Anda."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.header("Local ChromaDB Settings")
-local_chroma_path = st.sidebar.text_input(
-    "Local ChromaDB Path", 
-    value="./chroma_db", 
-    help="Path ke folder ChromaDB lokal Anda. (Misal: ./chroma_db)"
-)
-
-# --- Initialize Embedding Model (used for consistency) ---
-@st.cache_resource
-def load_embedding_model():
-    # Use the same embedding model as your local setup for consistency
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-embedding_model = load_embedding_model()
-
-# Create a ChromaDB embedding function for cloud
-class SentenceTransformerEmbeddingFunction(embedding_functions.EmbeddingFunction):
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2'):
-        self.model = SentenceTransformer(model_name)
-
-    def __call__(self, input: embedding_functions.Documents) -> embedding_functions.Embeddings:
-        return self.model.encode(input).tolist()
-
-chroma_embedding_function = SentenceTransformerEmbeddingFunction('all-MiniLM-L6-v2')
-
-
-# --- Main Application Logic ---
-
-if not trychroma_api_key or not trychroma_client_url:
-    st.warning("Harap masukkan API Key dan Client URL TryChroma di sidebar untuk melanjutkan.")
+# ---- Dependencies ----
+try:
+    import chromadb
+    # PERUBAHAN: Impor CloudClient, bukan hanya HttpClient
+    from chromadb import CloudClient
+    from chromadb.utils import embedding_functions
+except Exception as e:
+    st.error(f"Gagal mengimpor chromadb. Pastikan sudah terpasang. Error: {e}")
     st.stop()
 
-st.header("1. Hubungkan ke ChromaDB Lokal")
-local_chroma_client = None
 try:
-    if os.path.exists(local_chroma_path):
-        local_chroma_client = chromadb.PersistentClient(path=local_chroma_path)
-        st.success(f"Berhasil terhubung ke ChromaDB lokal di: `{local_chroma_path}`")
-        local_collections = local_chroma_client.list_collections()
-        if local_collections:
-            st.write("Koleksi lokal yang ditemukan:")
-            local_collection_names = [col.name for col in local_collections]
-            selected_local_collection_name = st.selectbox(
-                "Pilih koleksi lokal untuk diunggah:", 
-                options=["-- Pilih Koleksi --"] + local_collection_names
-            )
-        else:
-            st.info("Tidak ada koleksi di ChromaDB lokal Anda.")
-            selected_local_collection_name = None
+    import tiktoken
+except Exception: tiktoken = None
+try:
+    import docx
+except Exception: docx = None
+try:
+    import PyPDF2
+except Exception: PyPDF2 = None
+try:
+    from openai import OpenAI
+except Exception: OpenAI = None
+
+st.set_page_config(page_title="Chroma Uploader + RAG Chat", page_icon="📚", layout="wide")
+
+st.title("📚 Chroma Uploader + RAG Chat")
+st.caption("Upload dokumen → simpan ke Chroma → tanya dokumen dengan sitasi")
+
+# ---------------- Sidebar: Credentials & Settings ----------------
+with st.sidebar:
+    st.header("🔐 Koneksi Chroma")
+    chroma_mode = st.radio("Mode", ["Chroma Cloud", "Local (Persistent)"], index=0)
+    if chroma_mode == "Chroma Cloud":
+        st.info("Salin kredensial dari halaman 'Connect' database Anda di Chroma Cloud.")
+        # PERUBAHAN: Menghapus input Host yang tidak lagi diperlukan
+        tenant = st.text_input("Tenant", value="", help="Salin dari halaman koneksi database Anda.")
+        database = st.text_input("Database", value="n8nsmallcr", help="Salin dari halaman koneksi database Anda.")
+        chroma_api_key = st.text_input("Chroma API Key", type="password", help="Buat dengan tombol 'Create API key'.")
     else:
-        st.error(f"Folder ChromaDB lokal tidak ditemukan di: `{local_chroma_path}`")
-        st.info("Pastikan Anda sudah menjalankan aplikasi RAG sebelumnya untuk membuat database lokal.")
-        selected_local_collection_name = None
-except Exception as e:
-    st.error(f"Gagal terhubung ke ChromaDB lokal: {e}")
-    st.info("Pastikan path sudah benar dan folder tidak terkunci.")
-    selected_local_collection_name = None
+        persist_dir = st.text_input("Persist Directory", value="./chroma_data")
+        tenant = database = chroma_api_key = None
 
+    st.divider()
+    st.header("🧠 Embedding Model")
+    embed_choice = st.selectbox("Embedding function", ["OpenAIEmbeddings", "Sentence-Transformers (all-MiniLM-L6-v2)"], index=0)
+    openai_api_key = st.text_input("OPENAI_API_KEY (untuk embeddings & jawaban)", type="password", value=os.getenv("OPENAI_API_KEY", ""))
+    openai_model = st.text_input("OpenAI Chat Model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    collection_name = st.text_input("Collection Name", value="docs")
+    top_k = st.slider("Top-K retrieval", 1, 10, 5)
+    chunk_size = st.slider("Chunk size (chars)", 300, 2000, 900, step=50)
+    chunk_overlap = st.slider("Chunk overlap (chars)", 0, 400, 150, step=10)
 
-st.header("2. Hubungkan ke TryChroma Cloud")
-cloud_chroma_client = None
-try:
-    cloud_chroma_client = chromadb.HttpClient(
-        host=trychroma_client_url.replace("https://", "").replace("http://", ""), # Hapus protokol dari host
-        port=443 if "https" in trychroma_client_url else 80, # Sesuaikan port jika diperlukan
-        ssl=True if "https" in trychroma_client_url else False,
-        headers={"X-Chroma-Token": trychroma_api_key}
+# ---------------- Helpers ----------------
+def chunk_text(text, size=900, overlap=150):
+    if not text: return []
+    if tiktoken:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            toks = enc.encode(text)
+            chunks, i, tok_size, tok_overlap = [], 0, max(50, size // 4), max(0, overlap // 4)
+            while i < len(toks):
+                chunks.append(enc.decode(toks[i:i+tok_size]))
+                i += max(1, tok_size - tok_overlap)
+            return chunks
+        except Exception: pass
+    chunks, i = [], 0
+    while i < len(text):
+        chunks.append(text[i:i+size])
+        i += max(1, size - overlap)
+    return chunks
+
+def read_file(uploaded_file) -> str:
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+    if name.endswith((".txt", ".md")): return data.decode("utf-8", errors="ignore")
+    if name.endswith(".pdf"):
+        if PyPDF2 is None: raise RuntimeError("PyPDF2 belum terpasang.")
+        reader = PyPDF2.PdfReader(io.BytesIO(data))
+        return "\n\n".join([p.extract_text() or "" for p in reader.pages])
+    if name.endswith(".docx"):
+        if docx is None: raise RuntimeError("python-docx belum terpasang.")
+        return "\n".join([p.text for p in docx.Document(io.BytesIO(data)).paragraphs])
+    return data.decode("utf-8", errors="ignore")
+
+@st.cache_resource(show_spinner=False)
+def get_chroma_client():
+    if chroma_mode == "Chroma Cloud":
+        if not (tenant and database and chroma_api_key):
+            st.error("Lengkapi Tenant, Database, dan Chroma API Key.")
+            st.stop()
+        try:
+            # PERUBAHAN BESAR: Menggunakan CloudClient, bukan HttpClient
+            client = CloudClient(
+                tenant=tenant,
+                database=database,
+                api_key=chroma_api_key
+            )
+            client.heartbeat() # Cek koneksi
+            return client
+        except Exception as e:
+            st.error(f"Gagal konek ke Chroma Cloud: {e}")
+            st.stop()
+    else: # Local Persistent
+        try:
+            client = chromadb.PersistentClient(path=persist_dir)
+            client.heartbeat()
+            return client
+        except Exception as e:
+            st.error(f"Gagal membuat PersistentClient: {e}")
+            st.stop()
+
+@st.cache_resource(show_spinner=False)
+def get_embedding_function():
+    if embed_choice == "OpenAIEmbeddings":
+        if not openai_api_key:
+            st.error("OPENAI_API_KEY diperlukan.")
+            st.stop()
+        return embedding_functions.OpenAIEmbeddingFunction(
+            api_key=openai_api_key, model_name="text-embedding-3-small"
+        )
+    else:
+        return embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+
+def get_or_create_collection():
+    client = get_chroma_client()
+    emb_func = get_embedding_function()
+    return client.get_or_create_collection(
+        name=collection_name, embedding_function=emb_func, metadata={"hnsw:space": "cosine"}
     )
-    cloud_chroma_client.heartbeat() # Test connection
-    st.success(f"Berhasil terhubung ke TryChroma Cloud di: `{trychroma_client_url}`")
-    cloud_collections = cloud_chroma_client.list_collections()
-    if cloud_collections:
-        st.write("Koleksi yang sudah ada di TryChroma Cloud:")
-        for col in cloud_collections:
-            st.code(col.name)
-except Exception as e:
-    st.error(f"Gagal terhubung ke TryChroma Cloud: {e}")
-    st.info("Pastikan API Key, Client URL sudah benar, dan koneksi internet Anda stabil.")
-    st.stop() # Stop further execution if cloud connection fails
 
-st.header("3. Unggah Koleksi ke TryChroma Cloud")
-if selected_local_collection_name and selected_local_collection_name != "-- Pilih Koleksi --":
-    new_cloud_collection_name = st.text_input(
-        f"Nama koleksi di Cloud untuk `{selected_local_collection_name}`:",
-        value=f"{selected_local_collection_name}_cloud"
-    )
-    overwrite_existing = st.checkbox("Timpa koleksi di Cloud jika sudah ada (PERINGATAN: Ini akan menghapus data yang ada!)")
+# Sisa kode (fungsi RAG, tabs) tidak perlu diubah secara signifikan
+# ... (kode lainnya tetap sama) ...
+def build_prompt(question, results):
+    numbered = []
+    for i, (doc, meta) in enumerate(results, start=1):
+        src, chunk_idx = meta.get("source", "?"), meta.get("chunk", "?")
+        numbered.append(f"[{i}] Source: {src} (chunk {chunk_idx}) — {doc.strip()}")
+    context = "\n\n".join(numbered)
+    system = "Anda adalah asisten yang menjawab hanya dari konteks berikut. Berikan jawaban ringkas dan tambahkan sitasi [n] pada klaim penting."
+    user = f"Pertanyaan: {question}\n\nKonteks:\n{context}\n\nInstruksi: Jawab ringkas, lalu daftar sumber yang dirujuk."
+    return system, user
 
-    if st.button(f"Mulai Unggah Koleksi '{selected_local_collection_name}'"):
-        if not new_cloud_collection_name:
-            st.error("Nama koleksi di Cloud tidak boleh kosong.")
+def openai_answer(system_msg, user_msg):
+    if OpenAI is None or not openai_api_key:
+        st.error("OPENAI_API_KEY tidak tersedia/valid.")
+        st.stop()
+    client = OpenAI(api_key=openai_api_key)
+    try:
+        resp = client.chat.completions.create(
+            model=openai_model, messages=[{"role":"system","content":system_msg}, {"role":"user","content":user_msg}],
+            temperature=0.2)
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.error(f"Gagal memanggil OpenAI API: {e}")
+        return None
+
+tab_up, tab_list, tab_chat = st.tabs(["⬆️ Upload", "📄 List Dokumen", "💬 Chat"])
+
+with tab_up:
+    st.subheader("Upload Dokumen")
+    uploader = st.file_uploader("Pilih file (.pdf, .docx, .txt, .md)", accept_multiple_files=True, type=["pdf","docx","txt","md"])
+    if uploader and st.button("🚀 Upload ke Chroma"):
+        collection = get_or_create_collection()
+        with st.spinner("Memproses & mengunggah..."):
+            total_chunks = 0
+            for f in uploader:
+                try:
+                    text = read_file(f)
+                    chunks = chunk_text(text, size=chunk_size, overlap=chunk_overlap)
+                    if not chunks:
+                        st.warning(f"File {f.name} tidak menghasilkan chunk.")
+                        continue
+                    ids = [f"{f.name}-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(chunks))]
+                    metadatas = [{"source": f.name, "chunk": i} for i in range(len(chunks))]
+                    collection.add(documents=chunks, ids=ids, metadatas=metadatas)
+                    total_chunks += len(chunks)
+                except Exception as e:
+                    st.error(f"Gagal upload {f.name}: {e}")
+            if total_chunks > 0:
+                st.success(f"Selesai. Total chunks diunggah: {total_chunks}")
+
+with tab_list:
+    st.subheader("Daftar Dokumen")
+    if st.button("🔄 Refresh Daftar"):
+        collection = get_or_create_collection()
+        count = collection.count()
+        st.write(f"Total entri (chunks) dalam koleksi: {count}")
+        if count > 0:
+            with st.spinner("Mengambil daftar sumber..."):
+                entries = collection.get(limit=count, include=["metadatas"])
+                sources = sorted(list(set(m.get('source', 'unknown') for m in entries['metadatas'])))
+                st.dataframe(sources, use_container_width=True)
+
+with tab_chat:
+    st.subheader("Tanya Dokumen Anda")
+    question = st.text_input("Pertanyaan")
+    if st.button("Kirim Pertanyaan") and question.strip():
+        collection = get_or_create_collection()
+        with st.spinner("Mengambil konteks dari Chroma..."):
+            qres = collection.query(query_texts=[question], n_results=top_k, include=["documents", "metadatas"])
+        docs = (qres.get("documents") or [[]])[0]
+        metas = (qres.get("metadatas") or [[]])[0]
+        if not docs:
+            st.warning("Tidak ada hasil relevan ditemukan di dokumen.")
         else:
-            with st.spinner(f"Mengambil data dari koleksi lokal '{selected_local_collection_name}'..."):
-                try:
-                    local_collection = local_chroma_client.get_collection(name=selected_local_collection_name)
-                    # Fetch all data from the local collection
-                    all_data = local_collection.get(
-                        ids=local_collection.get()['ids'], # Get all IDs
-                        include=['documents', 'embeddings', 'metadatas']
-                    )
-
-                    documents = all_data['documents']
-                    embeddings = all_data['embeddings']
-                    metadatas = all_data['metadatas']
-                    ids = all_data['ids']
-
-                    st.success(f"Berhasil mengambil {len(documents)} item dari ChromaDB lokal.")
-
-                except Exception as e:
-                    st.error(f"Gagal mengambil data dari koleksi lokal: {e}")
-                    st.stop()
-
-            with st.spinner(f"Mengunggah data ke TryChroma Cloud di koleksi '{new_cloud_collection_name}'..."):
-                try:
-                    # Check if collection exists in cloud and handle overwrite
-                    cloud_collection_names = [col.name for col in cloud_chroma_client.list_collections()]
-                    if new_cloud_collection_name in cloud_collection_names:
-                        if overwrite_existing:
-                            st.warning(f"Menghapus koleksi '{new_cloud_collection_name}' yang sudah ada di Cloud...")
-                            cloud_chroma_client.delete_collection(name=new_cloud_collection_name)
-                            st.success("Koleksi lama dihapus.")
-                        else:
-                            st.error(f"Koleksi '{new_cloud_collection_name}' sudah ada di Cloud. Centang 'Timpa koleksi...' atau gunakan nama baru.")
-                            st.stop()
-                    
-                    # Create the new collection in cloud
-                    cloud_collection = cloud_chroma_client.create_collection(
-                        name=new_cloud_collection_name,
-                        embedding_function=chroma_embedding_function # Penting: Gunakan embedding function yang sama
-                    )
-
-                    # Add data in chunks to avoid API limits for large collections
-                    chunk_size = 500 # Adjust based on your API limits and network
-                    for i in range(0, len(documents), chunk_size):
-                        st.info(f"Mengunggah chunk {i//chunk_size + 1}/{(len(documents)//chunk_size)+1}...")
-                        chunk_docs = documents[i:i + chunk_size]
-                        chunk_embeds = embeddings[i:i + chunk_size]
-                        chunk_metadatas = metadatas[i:i + chunk_size]
-                        chunk_ids = ids[i:i + chunk_size]
-
-                        cloud_collection.add(
-                            documents=chunk_docs,
-                            embeddings=chunk_embeds,
-                            metadatas=chunk_metadatas,
-                            ids=chunk_ids
-                        )
-                    
-                    st.success(f"Berhasil mengunggah koleksi '{new_cloud_collection_name}' ke TryChroma Cloud!")
-                    st.balloons()
-
-                except Exception as e:
-                    st.error(f"Gagal mengunggah ke TryChroma Cloud: {e}")
-                    st.info("Periksa API Key, URL, dan pastikan tidak ada batasan ukuran data atau rate limit dari TryChroma.")
-else:
-    st.info("Harap pilih koleksi lokal di langkah 1 untuk memulai proses unggah.")
-
-st.markdown("---")
-st.sidebar.markdown("### Cara Kerja")
-st.sidebar.markdown(
-    """
-    Aplikasi ini membaca data (dokumen, embedding, metadata, dan ID) dari 
-    koleksi ChromaDB lokal Anda. Kemudian, ia menghubungkan ke layanan 
-    TryChroma Cloud Anda menggunakan API Key dan URL yang Anda berikan. 
-    Terakhir, ia membuat koleksi baru di Cloud dan mengunggah semua data 
-    dari koleksi lokal ke sana.
-    """
-)
-st.sidebar.markdown("---")
-st.sidebar.markdown("### Penting:")
-st.sidebar.markdown(
-    """
-    *   Pastikan Anda menggunakan **model embedding yang sama** baik untuk 
-        ChromaDB lokal maupun saat mengunggah ke Cloud. Di sini digunakan 
-        `all-MiniLM-L6-v2`.
-    *   Mengunggah koleksi besar mungkin memakan waktu dan tergantung pada 
-        batasan API dari TryChroma. Data diunggah dalam chunk.
-    *   Menimpa koleksi akan **menghapus semua data** yang sudah ada di 
-        koleksi Cloud dengan nama yang sama.
-    """
-)
+            pairs = list(zip(docs, metas))
+            system_msg, user_msg = build_prompt(question, pairs)
+            with st.spinner("Menyusun jawaban..."):
+                answer = openai_answer(system_msg, user_msg)
+            if answer:
+                st.markdown("### 🧾 Jawaban")
+                st.write(answer)
+                st.markdown("### 📚 Sumber yang Digunakan")
+                for i, (doc, m) in enumerate(pairs, start=1):
+                    with st.expander(f"Sumber [{i}]: {m.get('source','?')} (chunk {m.get('chunk','?')})"):
+                        st.write(doc)
