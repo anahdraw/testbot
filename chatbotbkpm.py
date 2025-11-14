@@ -1,5 +1,5 @@
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader # Import yang benar
+from langchain_community import PyPDFLoader # Import yang benar
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import Pinecone # Import yang benar
