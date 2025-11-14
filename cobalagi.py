@@ -4,7 +4,10 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 import openai
 import os
-import tiktoken # Untuk menghitung token jika diperlukan, meski tidak langsung digunakan di sini
+import tiktoken
+
+# Import pengecualian spesifik dari OpenAI
+from openai import OpenAIError, APIError, AuthenticationError, RateLimitError
 
 # --- Streamlit UI: Sidebar ---
 st.sidebar.title("Pengaturan")
@@ -16,14 +19,20 @@ openai_api_key = st.sidebar.text_input(
     help="Dapatkan kunci API Anda dari platform.openai.com"
 )
 
-# Set OpenAI API Key
+# Set OpenAI API Key dan Inisialisasi Klien
+client_openai = None # Inisialisasi di luar if agar bisa diakses global
 if openai_api_key:
     os.environ["OPENAI_API_KEY"] = openai_api_key
-    openai.api_key = openai_api_key
+    openai.api_key = openai_api_key # Ini untuk kompatibilitas dengan beberapa fungsi lama jika ada
     st.sidebar.success("OpenAI API Key berhasil diatur!")
+    
+    try:
+        client_openai = openai.OpenAI() # Inisialisasi klien OpenAI baru
+    except Exception as e:
+        st.sidebar.error(f"Gagal menginisialisasi klien OpenAI: {e}")
+        st.stop() # Hentikan jika klien OpenAI tidak bisa diinisialisasi
 else:
     st.sidebar.warning("Harap masukkan OpenAI API Key Anda untuk melanjutkan.")
-    # Jika API Key tidak diatur, nonaktifkan fungsi utama
     st.stop() # Menghentikan eksekusi script lebih lanjut jika API key belum diisi
 
 # --- Inisialisasi Model dan ChromaDB (setelah API Key diatur) ---
@@ -38,8 +47,15 @@ model = load_embedding_model()
 # Inisialisasi ChromaDB client
 @st.cache_resource
 def get_chroma_client():
-    return chromadb.PersistentClient(path="./chroma_db") # Simpan database secara persisten
-
+    try:
+        # Mencoba membuat koneksi persisten ke ChromaDB
+        # Penting: Pastikan folder ./chroma_db memiliki izin tulis
+        return chromadb.PersistentClient(path="./chroma_db") 
+    except Exception as e:
+        st.error(f"Gagal menginisialisasi ChromaDB PersistentClient: {e}")
+        st.info("Pastikan Anda memiliki izin tulis di direktori saat ini dan tidak ada proses lain yang mengunci folder 'chroma_db'.")
+        st.stop() # Hentikan aplikasi jika ChromaDB tidak bisa diinisialisasi
+        
 client = get_chroma_client()
 
 # --- Fungsi-fungsi Utama ---
@@ -59,23 +75,18 @@ def load_and_split_pdf(uploaded_file):
 def add_documents_to_chroma(collection_name, texts):
     collection = client.get_or_create_collection(name=collection_name)
     
-    # Periksa apakah ada dokumen dengan ID yang sama
-    # Jika Anda ingin mengizinkan upload ulang dengan nama koleksi yang sama
-    # dan menimpa, Anda perlu logika penghapusan yang lebih canggih.
-    # Untuk saat ini, kita akan berasumsi nama koleksi unik.
-
     embeddings = model.encode(texts).tolist()
-    # Pastikan ID unik. Kita bisa pakai hash dari teks atau UUID
-    # Untuk contoh ini, ID sederhana:
-    current_ids = collection.get()['ids']
+    
+    # Generate unique IDs based on collection name and index
+    current_ids_in_collection = collection.get()['ids']
     new_ids = []
-    for i in range(len(texts)):
-        doc_id = f"{collection_name}_doc_{i}"
-        # Jika ID sudah ada, tambahkan suffix
-        while doc_id in current_ids:
-            i += 1
-            doc_id = f"{collection_name}_doc_{i}"
-        new_ids.append(doc_id)
+    for i, text_chunk in enumerate(texts):
+        potential_id = f"{collection_name}_doc_{i}"
+        counter = 0
+        while potential_id in current_ids_in_collection:
+            counter += 1
+            potential_id = f"{collection_name}_doc_{i}_{counter}"
+        new_ids.append(potential_id)
 
     collection.add(
         embeddings=embeddings,
@@ -93,7 +104,7 @@ def retrieve_documents(query, collection_name, n_results=4):
             query_embeddings=query_embedding,
             n_results=n_results
         )
-        return results['documents'][0] if results['documents'] else []
+        return results['documents'][0] if results and 'documents' in results and results['documents'] else []
     except Exception as e:
         st.error(f"Error saat mengambil dokumen dari ChromaDB: {e}")
         return []
@@ -115,11 +126,13 @@ def create_rag_prompt(query, context_docs):
 
 # Fungsi untuk berinteraksi dengan OpenAI GPT
 def generate_response(prompt):
-    if not openai.api_key:
-        st.error("OpenAI API Key belum diatur.")
+    global client_openai # Pastikan kita mengakses client_openai global
+    if not client_openai:
+        st.error("OpenAI client belum diinisialisasi. Harap masukkan API Key.")
         return None
+    
     try:
-        response = openai.ChatCompletion.create(
+        response = client_openai.chat.completions.create( # Menggunakan .chat.completions.create
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "Anda adalah asisten yang membantu."},
@@ -128,9 +141,21 @@ def generate_response(prompt):
             temperature=0.7,
             max_tokens=500
         )
-        return response.choices[0].message['content']
-    except openai.error.OpenAIError as e:
-        st.error(f"Terjadi kesalahan OpenAI: {e}")
+        return response.choices[0].message.content # Akses konten
+    except AuthenticationError:
+        st.error("OpenAI Authentication Error: API Key Anda mungkin salah atau kedaluwarsa.")
+        return None
+    except RateLimitError:
+        st.error("OpenAI Rate Limit Error: Anda terlalu sering membuat permintaan, coba lagi nanti.")
+        return None
+    except APIError as e:
+        st.error(f"OpenAI API Error: {e.status_code} - {e.response.json()}") # Tampilkan detail error dari response
+        return None
+    except OpenAIError as e: # Tangkap kesalahan OpenAI lainnya
+        st.error(f"Terjadi kesalahan OpenAI umum: {e}")
+        return None
+    except Exception as e: # Tangkap kesalahan non-OpenAI lainnya
+        st.error(f"Terjadi kesalahan tak terduga saat menghubungi OpenAI: {e}")
         return None
 
 # --- Streamlit UI: Main Content ---
@@ -170,6 +195,7 @@ try:
         selected_collection = st.sidebar.selectbox(
             "Pilih koleksi:",
             options=["-- Pilih Koleksi --"] + collection_names,
+            index=0, # Default to "Pilih Koleksi"
             key="collection_selector"
         )
 
@@ -198,8 +224,9 @@ st.header("2. Ajukan Pertanyaan")
 
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
+# Ensure current_collection is always initialized even if it's None
 if 'current_collection' not in st.session_state:
-    st.session_state.current_collection = None # Pastikan ini diinisialisasi
+    st.session_state.current_collection = None 
 
 if st.session_state.current_collection:
     st.info(f"Anda sedang chatting dengan dokumen di koleksi: **{st.session_state.current_collection}**")
