@@ -1,9 +1,8 @@
 import streamlit as st
-from langchain.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader # Perubahan di sini
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import Pinecone
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI # Perubahan di sini
+from langchain_pinecone import Pinecone # Perubahan di sini
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 import pinecone
@@ -26,7 +25,7 @@ with st.sidebar:
 
     if st.button("Proses Dokumen dan Inisialisasi Chatbot"):
         if openai_api_key and pinecone_api_key and uploaded_file:
-            os.environ["OPENAI_API_KEY"] = openai_api_key
+            # os.environ["OPENAI_API_KEY"] = openai_api_key # Tidak perlu lagi jika diteruskan langsung
             
             pinecone.init(
                 api_key=pinecone_api_key,
@@ -49,7 +48,8 @@ with st.sidebar:
                 texts = text_splitter.split_documents(documents)
 
                 # 3. Membuat Embedding dan Menyimpan ke Pinecone
-                embeddings = OpenAIEmbeddings(model="text-embedding-ada-002") # Menggunakan adasmall
+                # Pastikan OpenAIEmbeddings menerima api_key
+                embeddings = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=openai_api_key) 
                 
                 # Cek apakah index sudah ada, jika belum buat
                 if pinecone_index_name not in pinecone.list_indexes():
@@ -59,6 +59,7 @@ with st.sidebar:
                         metric='cosine'
                     )
                 
+                # Gunakan Pinecone dari langchain_pinecone
                 docsearch = Pinecone.from_documents(
                     texts, 
                     embeddings, 
@@ -87,7 +88,8 @@ if "embeddings" not in st.session_state:
 # --- Inisialisasi Conversational Chain setelah vectorstore siap ---
 if st.session_state.vectorstore and st.session_state.conversation is None:
     if openai_api_key:
-        llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7) # Menggunakan model 3.5 turbo
+        # Pastikan ChatOpenAI menerima api_key
+        llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7, openai_api_key=openai_api_key) 
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         st.session_state.conversation = ConversationalRetrievalChain.from_llm(
             llm=llm,
