@@ -133,7 +133,7 @@ def generate_response(prompt):
     
     try:
         response = client_openai.chat.completions.create( # Menggunakan .chat.completions.create
-            model="gpt-5-mini",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Anda adalah asisten yang membantu."},
                 {"role": "user", "content": prompt}
